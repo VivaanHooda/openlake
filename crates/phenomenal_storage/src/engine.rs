@@ -22,7 +22,7 @@ use phenomenal_io::{BucketMeta, ByteStream, DeleteOptions, ErasureInfo, FileInfo
 use uuid::Uuid;
 
 use crate::cluster::{ClusterConfig, DiskAddr, NodeId};
-use crate::dsync::DsyncClient;
+use crate::dsync::{DsyncClient, LockGuard};
 use crate::ec::{self, Erasure};
 use crate::error::{StorageError, StorageResult};
 use crate::object::{MultipartInit, ObjectInfo, StorageClass};
@@ -40,24 +40,49 @@ const PART1_PATH_SUFFIX:     &str = "part.1";
 pub struct Engine {
     cluster:  ClusterConfig,
     backends: HashMap<DiskAddr, Rc<dyn StorageBackend>>,
-    dsync:    Rc<DsyncClient>,
+    /// Per-erasure-set lock planes, indexed by `set_index`. Each entry's
+    /// peers are exactly the unique nodes that own slots in that set,
+    /// so a coordinator only votes against the data targets it's about
+    /// to write — never the full cluster. Length is `cluster.num_sets()`.
+    dsync_by_set: Vec<Rc<DsyncClient>>,
     self_id:  NodeId,
     inline_threshold: usize,
 }
 
 impl Engine {
     pub fn new(
-        cluster:  ClusterConfig,
-        backends: HashMap<DiskAddr, Rc<dyn StorageBackend>>,
-        dsync:    Rc<DsyncClient>,
-        self_id:  NodeId,
+        cluster:      ClusterConfig,
+        backends:     HashMap<DiskAddr, Rc<dyn StorageBackend>>,
+        dsync_by_set: Vec<Rc<DsyncClient>>,
+        self_id:      NodeId,
     ) -> Self {
-        Self { cluster, backends, dsync, self_id, inline_threshold: DEFAULT_INLINE_THRESHOLD }
+        // Lock plane is per-set; the caller must size the table to the
+        // cluster's set count. A mismatch indicates a wiring bug
+        // (e.g. CLI forgot to size the no-op vec), not a runtime
+        // condition we can recover from.
+        debug_assert_eq!(
+            dsync_by_set.len(),
+            cluster.num_sets().max(1),
+            "dsync_by_set must have one entry per erasure set",
+        );
+        Self { cluster, backends, dsync_by_set, self_id, inline_threshold: DEFAULT_INLINE_THRESHOLD }
     }
 
-    pub fn with_inline_threshold(mut self, bytes: usize) -> Self {
-        self.inline_threshold = bytes;
-        self
+    /// Lock plane for the set that owns `(bucket, key)`. Object-scoped
+    /// locks (PUT, DELETE, multipart Complete, UploadPart) route here.
+    fn dsync_for_obj(&self, bucket: &str, key: &str) -> &Rc<DsyncClient> {
+        let s = self.cluster.set_index_for(bucket, key);
+        &self.dsync_by_set[s]
+    }
+
+    /// Lock plane for bucket-scoped operations (CreateBucket,
+    /// DeleteBucket, PutBucketVersioning). Hashing the bucket alone is
+    /// enough to pick a stable set since the user accepts that
+    /// CopyObject and cross-pool drain aren't supported — every
+    /// bucket-scoped acquire for the same bucket lands on the same set.
+    fn dsync_for_bucket(&self, bucket: &str) -> &Rc<DsyncClient> {
+        let s = self.cluster.set_index_for(bucket, "");
+        &self.dsync_by_set[s]
     }
 
     fn local(&self) -> &Rc<dyn StorageBackend> {
@@ -146,7 +171,7 @@ impl Engine {
 
     pub async fn create_bucket(&self, bucket: &str, meta: BucketMeta) -> StorageResult<()> {
         validate_bucket_name(bucket)?;
-        let _lock = self.dsync
+        let _lock = self.dsync_for_bucket(bucket)
             .acquire(&Self::bkt_lock_key(bucket), LOCK_ACQUIRE_TIMEOUT).await?;
         let backends = self.all_backends()?;
         let n        = backends.len();
@@ -202,7 +227,7 @@ impl Engine {
 
     pub async fn put_bucket_versioning(&self, bucket: &str, new_status: VersioningStatus) -> StorageResult<()> {
         validate_bucket_name(bucket)?;
-        let _lock = self.dsync
+        let _lock = self.dsync_for_bucket(bucket)
             .acquire(&Self::bkt_lock_key(bucket), LOCK_ACQUIRE_TIMEOUT).await?;
         self.stat_bucket(bucket).await?;
         let mut meta = self.get_bucket_meta(bucket).await?;
@@ -247,7 +272,7 @@ impl Engine {
 
     pub async fn delete_bucket(&self, bucket: &str, force: bool) -> StorageResult<()> {
         validate_bucket_name(bucket)?;
-        let _lock = self.dsync
+        let _lock = self.dsync_for_bucket(bucket)
             .acquire(&Self::bkt_lock_key(bucket), LOCK_ACQUIRE_TIMEOUT).await?;
         let backends = self.all_backends()?;
 
@@ -381,7 +406,9 @@ impl Engine {
         let parity_shards = session_fi.erasure.parity_blocks as usize;
         let data_shards   = session_fi.erasure.data_blocks   as usize;
 
-        let _lock = self.dsync
+        // Part lock rides the same set as the assembled object; the
+        // session and final FileInfo both hash on (bucket, key).
+        let _lock = self.dsync_for_obj(bucket, key)
             .acquire(&Self::part_lock_key(bucket, key, upload_id, part_number),
                      LOCK_ACQUIRE_TIMEOUT).await?;
 
@@ -494,7 +521,7 @@ impl Engine {
             }
         }
 
-        let _lock = self.dsync
+        let lock = self.dsync_for_obj(bucket, key)
             .acquire(&Self::obj_lock_key(bucket, key), LOCK_ACQUIRE_TIMEOUT).await?;
 
         let backends     = self.set_backends(bucket, key)?;
@@ -576,6 +603,7 @@ impl Engine {
         });
         join_all(cleanups).await;
 
+        lock.check()?; // fence before commit
         promote_versions(
             &backends,
             MULTIPART_VOL, &session_path,
@@ -605,7 +633,7 @@ impl Engine {
         src:    &mut dyn ByteStream,
         content_type: Option<String>,
     ) -> StorageResult<ObjectInfo> {
-        let _lock = self.dsync
+        let lock = self.dsync_for_obj(bucket, key)
             .acquire(&Self::obj_lock_key(bucket, key), LOCK_ACQUIRE_TIMEOUT).await?; // rpc 1
 
         let mod_time_ms = now_ms();
@@ -614,10 +642,10 @@ impl Engine {
         let version_id  = self.resolve_put_version_id(bucket).await?; // rpc 2
 
         if (size as usize) <= self.inline_threshold {
-            self.put_inline(bucket, key, size, src, content_type,
+            self.put_inline(&lock, bucket, key, size, src, content_type,
                             mod_time_ms, version_id, &backends, quorum).await
         } else {
-            self.put_ec(bucket, key, size, src, content_type,
+            self.put_ec(&lock, bucket, key, size, src, content_type,
                         mod_time_ms, version_id, &backends, quorum).await
         }
     }
@@ -630,6 +658,7 @@ impl Engine {
     #[allow(clippy::too_many_arguments)]
     async fn put_inline(
         &self,
+        lock:         &LockGuard,
         bucket:       &str,
         key:          &str,
         size:         u64,
@@ -659,6 +688,7 @@ impl Engine {
 
         let staging_id   = Uuid::new_v4().simple().to_string();
         let per_disk_fis = with_per_disk_index(&base_fi, &base_erasure, n);
+        lock.check()?; // fence before commit
         promote_versions(backends, STAGING_VOL, &staging_id, per_disk_fis, bucket, key, quorum).await?;
 
         Ok(ObjectInfo {
@@ -677,6 +707,7 @@ impl Engine {
     #[allow(clippy::too_many_arguments)]
     async fn put_ec(
         &self,
+        lock:         &LockGuard,
         bucket:       &str,
         key:          &str,
         size:         u64,
@@ -747,6 +778,7 @@ impl Engine {
             base_fi.data_dir   = data_dir.clone();
             let base_erasure   = default_erasure_info(data_shards as u8, parity_shards as u8, n as u8);
             let per_disk_fis   = with_per_disk_index(&base_fi, &base_erasure, n);
+            lock.check()?; // fence before commit
             promote_versions(backends, STAGING_VOL, &staging_id, per_disk_fis, bucket, key, quorum).await?; // rpc 5, 6, 7
 
             Ok(ObjectInfo {
@@ -795,6 +827,31 @@ impl Engine {
         version_id: &str,
     ) -> StorageResult<(ObjectInfo, Box<dyn ByteStream>)> {
         self.get_versioned(bucket, key, Some(version_id)).await
+    }
+
+    /// GET a byte window of the latest version. `offset + length` MUST
+    /// be within `info.size`; the S3 handler validates the request's
+    /// `Range:` header against `info.size` before calling us. The
+    /// implementation composes a [`SkipTakeStream`] over the existing
+    /// full-object walker (inline body or EC stripe walker), so no
+    /// new fanout to the set is introduced.
+    ///
+    /// EC objects still pay the cost of fetching and decoding the
+    /// leading stripes before discarding them; a later optimization
+    /// can teach `open_ec_part_stream` to skip whole stripes when
+    /// `offset` is stripe aligned. For the inline path (≤128 KiB
+    /// payload embedded in `xl.meta`) the skip is free.
+    pub async fn get_range(
+        &self,
+        bucket: &str,
+        key:    &str,
+        offset: u64,
+        length: u64,
+    ) -> StorageResult<(ObjectInfo, Box<dyn ByteStream>)> {
+        let (info, full) = self.get_versioned(bucket, key, None).await?;
+        let bounded: Box<dyn ByteStream> =
+            Box::new(phenomenal_io::SkipTakeStream::new(full, offset, length));
+        Ok((info, bounded))
     }
 
     // todo: @arnav this should not be an engine specific concern, the respective backend can optianlly accept a version id for get, and can serve it instead of the head.
@@ -925,7 +982,7 @@ impl Engine {
     // todo: @arnav check why were not checking any querym on the delete, and surfacing the error accordingly, check parity against other s3 impls
     /// DELETE. Fan out to every disk in the set.
     pub async fn delete(&self, bucket: &str, key: &str) -> StorageResult<()> {
-        let _lock = self.dsync
+        let _lock = self.dsync_for_obj(bucket, key)
             .acquire(&Self::obj_lock_key(bucket, key), LOCK_ACQUIRE_TIMEOUT).await?;
         let backends = self.set_backends(bucket, key)?;
         let results = join_all(backends.iter().map(|b| {
@@ -2225,8 +2282,11 @@ mod tests {
             let addr = DiskAddr { node_id: i as NodeId, disk_idx: 0 };
             backends.insert(addr, Rc::new(LocalFsBackend::new(d.path()).unwrap()));
         }
-        let dsync = Rc::new(crate::dsync::DsyncClient::no_op());
-        let e = Engine::new(cluster, backends, dsync, 0);
+        let num_sets = cluster.num_sets().max(1);
+        let dsync_by_set: Vec<Rc<crate::dsync::DsyncClient>> = (0..num_sets)
+            .map(|_| Rc::new(crate::dsync::DsyncClient::no_op()))
+            .collect();
+        let e = Engine::new(cluster, backends, dsync_by_set, 0);
         e.create_bucket("buk", BucketMeta::new(0, false)).await.unwrap();
         (dirs, e)
     }

@@ -16,7 +16,7 @@ use send_wrapper::SendWrapper;
 use serde::Deserialize;
 
 use phenomenal_io::stream::ByteStream;
-use phenomenal_io::VersioningStatus;
+use phenomenal_io::{SkipTakeStream, VersioningStatus};
 use phenomenal_storage::ObjectInfo;
 
 use crate::auth::AuthError;
@@ -56,19 +56,19 @@ pub struct ObjectQuery {
     pub uploads:     Option<String>,
 }
 
-// todo: @arnav implement multi-part (multipart upload + ?partNumber on GET)
+// todo: @arnav implement ?partNumber on GET (fetch one part of a
+// multipart assembled object). Multipart upload is wired; per part
+// reads are still pending and would compose on top of get_range.
 pub async fn get_object(
     State(state):       State<AppState>,
     Path((bucket, key)): Path<(String, String)>,
     Query(query):       Query<ObjectQuery>,
+    headers:            HeaderMap,
 ) -> Result<Response, AppError> {
-    // Normalize + validate ?versionId. Acceptable inputs match MinIO:
-    //   * absent or empty                  → latest version
-    //   * literal "null"                   → the null version
-    //   * a parseable UUID (with dashes)   → that specific version
-    // Anything else is rejected with 400 InvalidVersionID before any
-    // engine work runs.
     let version_id = parse_version_id(query.version_id.as_deref())?;
+    // Parse the Range header syntactically before any engine work so
+    // a malformed value returns 400 without touching disks.
+    let range_spec = parse_range_header(&headers)?;
 
     let engine = state.engine().clone();
     let (info, byte_stream) = SendWrapper::new(async move {
@@ -79,7 +79,24 @@ pub async fn get_object(
     })
     .await?;
 
-    Ok(stream_object_response(info, byte_stream))
+    // Resolve the syntactic spec against the actual object size. If
+    // the resolved window is empty (start past EOF, suffix of length
+    // zero, etc.) emit 416 with Content-Range: bytes */total per
+    // RFC 7233 §4.4 so clients can reissue with a valid window.
+    let range = match range_spec {
+        None       => None,
+        Some(spec) => match resolve_range(spec, info.size) {
+            Some(window) => Some(window),
+            None         => return Ok(range_not_satisfiable(&info)),
+        },
+    };
+
+    let final_stream: Box<dyn ByteStream> = match range {
+        None                  => byte_stream,
+        Some((offset, length)) => Box::new(SkipTakeStream::new(byte_stream, offset, length)),
+    };
+
+    Ok(stream_object_response(info, final_stream, range))
 }
 
 /// `?versionId=...` validation — mirrors MinIO's `getOpts` (cmd/object-api-options.go:101-110).
@@ -628,28 +645,62 @@ fn io_error_msg(e: phenomenal_io::IoError) -> &'static str {
     "PUT body initialization failed"
 }
 
+/// Serialise an `ObjectInfo` + body stream as an S3 GET response. When
+/// `range` is `None` the response is a normal 200 with `Content-Length`
+/// = full object size. When `range` is `Some((offset, length))` the
+/// response is 206 Partial Content with `Content-Length` = `length`
+/// and `Content-Range: bytes offset-(offset+length-1)/total`. The
+/// body stream has already been wrapped by `SkipTakeStream` at the
+/// handler level so we just cap the frame loop at `length` here.
 fn stream_object_response(
     info: ObjectInfo,
     byte_stream: Box<dyn ByteStream>,
+    range: Option<(u64, u64)>,
 ) -> Response {
     let total = info.size;
+    let (status, served_len) = match range {
+        None              => (StatusCode::OK,              total),
+        Some((_, length)) => (StatusCode::PARTIAL_CONTENT, length),
+    };
+
     let mut headers = HeaderMap::new();
     populate_object_headers(&mut headers, &info);
     headers.insert(
         axum::http::header::CONTENT_LENGTH,
-        HeaderValue::from(total),
+        HeaderValue::from(served_len),
     );
+    if let Some((offset, length)) = range {
+        // length > 0 here because `resolve_range` filters empty
+        // windows out, so offset+length-1 never underflows.
+        let end = offset + length - 1;
+        let v = HeaderValue::from_str(&format!("bytes {}-{}/{}", offset, end, total))
+            .expect("range header from u64s is always valid ASCII");
+        headers.insert(axum::http::header::CONTENT_RANGE, v);
+        // RFC 7233 §4.1: 206 responses SHOULD also include Accept-Ranges
+        // so clients learn the unit. Cheap and explicit.
+        headers.insert(
+            axum::http::header::ACCEPT_RANGES,
+            HeaderValue::from_static("bytes"),
+        );
+    } else {
+        // Advertise byte range support on full responses too. Some S3
+        // clients probe this before issuing parallel range GETs.
+        headers.insert(
+            axum::http::header::ACCEPT_RANGES,
+            HeaderValue::from_static("bytes"),
+        );
+    }
 
     let frames = SendWrapper::new(stream::unfold(
-        (byte_stream, total, 0u64),
-        move |(mut body, total, mut sent)| async move {
-            if sent >= total {
+        (byte_stream, served_len, 0u64),
+        move |(mut body, cap, mut sent)| async move {
+            if sent >= cap {
                 return None;
             }
             match body.read().await {
                 Ok(chunk) if chunk.is_empty() => None,
                 Ok(chunk) => {
-                    let take = (total - sent).min(chunk.len() as u64) as usize;
+                    let take = (cap - sent).min(chunk.len() as u64) as usize;
                     let frame = if take < chunk.len() {
                         bytes::Bytes::slice(&chunk, ..take)
                     } else {
@@ -658,19 +709,121 @@ fn stream_object_response(
                     sent += frame.len() as u64;
                     Some((
                         Ok::<bytes::Bytes, std::io::Error>(frame),
-                        (body, total, sent),
+                        (body, cap, sent),
                     ))
                 }
                 Err(e) => Some((
                     Err(std::io::Error::other(e.to_string())),
-                    (body, total, sent),
+                    (body, cap, sent),
                 )),
             }
         },
     ));
 
     let body = Body::from_stream(frames);
-    (StatusCode::OK, headers, body).into_response()
+    (status, headers, body).into_response()
+}
+
+/// Syntactic representation of an HTTP `Range:` header value as parsed
+/// off the request, before being resolved against the object size.
+/// S3 accepts a single byte range only; multi-range requests
+/// (`bytes=0-99,200-299`) are rejected with 400.
+#[derive(Debug, Clone, Copy)]
+enum RangeSpec {
+    /// `bytes=start-end` (end is inclusive).
+    Bounded   { start: u64, end: u64 },
+    /// `bytes=start-` (from start to EOF).
+    OpenEnded { start: u64 },
+    /// `bytes=-last_n` (the last `last_n` bytes of the object).
+    Suffix    { last_n: u64 },
+}
+
+/// Parse the request's `Range:` header. Returns `Ok(None)` when no
+/// header is present, `Ok(Some(spec))` when it parses cleanly, and
+/// `Err(Malformed)` on syntactic issues. Bounds against object size
+/// are resolved separately by `resolve_range`.
+fn parse_range_header(headers: &HeaderMap) -> Result<Option<RangeSpec>, AppError> {
+    let raw = match headers.get(axum::http::header::RANGE) {
+        None    => return Ok(None),
+        Some(v) => v.to_str().map_err(|_| AppError::Malformed("invalid Range header"))?,
+    };
+    let spec = raw
+        .strip_prefix("bytes=")
+        .ok_or(AppError::Malformed("Range must start with 'bytes='"))?;
+    if spec.contains(',') {
+        return Err(AppError::Malformed("multi-range requests are not supported"));
+    }
+    let (start_str, end_str) = spec
+        .split_once('-')
+        .ok_or(AppError::Malformed("Range missing '-' separator"))?;
+    let parse_u64 = |s: &str| -> Result<u64, AppError> {
+        s.parse::<u64>().map_err(|_| AppError::Malformed("invalid integer in Range"))
+    };
+    let parsed = match (start_str.is_empty(), end_str.is_empty()) {
+        (true,  true)  => return Err(AppError::Malformed("Range 'bytes=-' has neither start nor suffix")),
+        (true,  false) => RangeSpec::Suffix    { last_n: parse_u64(end_str)? },
+        (false, true)  => RangeSpec::OpenEnded { start:  parse_u64(start_str)? },
+        (false, false) => {
+            let start = parse_u64(start_str)?;
+            let end   = parse_u64(end_str)?;
+            if end < start {
+                return Err(AppError::Malformed("Range end is before start"));
+            }
+            RangeSpec::Bounded { start, end }
+        }
+    };
+    Ok(Some(parsed))
+}
+
+/// Resolve a parsed `RangeSpec` against the actual object size into a
+/// concrete `(offset, length)` window. Returns `None` when the range
+/// is unsatisfiable (start past EOF, zero length suffix, empty object
+/// with any range), which the handler then maps to 416.
+fn resolve_range(spec: RangeSpec, size: u64) -> Option<(u64, u64)> {
+    match spec {
+        RangeSpec::Bounded { start, end } => {
+            if size == 0 || start >= size {
+                return None;
+            }
+            // Clamp end to the last byte. AWS S3 returns the clamped
+            // window (it does not 416 on an end past EOF; only start
+            // past EOF is unsatisfiable).
+            let end = end.min(size - 1);
+            Some((start, end - start + 1))
+        }
+        RangeSpec::OpenEnded { start } => {
+            if size == 0 || start >= size {
+                return None;
+            }
+            Some((start, size - start))
+        }
+        RangeSpec::Suffix { last_n } => {
+            if last_n == 0 || size == 0 {
+                return None;
+            }
+            let last_n = last_n.min(size);
+            Some((size - last_n, last_n))
+        }
+    }
+}
+
+/// Build a 416 Range Not Satisfiable response. Includes
+/// `Content-Range: bytes */total` per RFC 7233 §4.4 so clients can
+/// reissue with a valid window. Body is empty.
+fn range_not_satisfiable(info: &ObjectInfo) -> Response {
+    let mut headers = HeaderMap::new();
+    populate_object_headers(&mut headers, info);
+    headers.insert(
+        axum::http::header::CONTENT_RANGE,
+        HeaderValue::from_str(&format!("bytes */{}", info.size))
+            .expect("'*/N' header value is always valid ASCII"),
+    );
+    headers.insert(axum::http::header::CONTENT_LENGTH, HeaderValue::from(0u64));
+    headers.insert(
+        axum::http::header::ACCEPT_RANGES,
+        HeaderValue::from_static("bytes"),
+    );
+    (StatusCode::RANGE_NOT_SATISFIABLE, headers).into_response()
 }
 
 fn populate_object_headers(headers: &mut HeaderMap, info: &ObjectInfo) {

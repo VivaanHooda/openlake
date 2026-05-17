@@ -29,7 +29,7 @@ pub use local_fs::{LocalFsBackend, MULTIPART_VOL, STAGING_VOL, SYSTEM_BUCKET};
 pub use remote_fs::{PeerClient, RemoteBackend};
 pub use stream::{
     pump_compio_to_sink, pump_n, read_full, ByteSink, ByteStream,
-    BytesByteStream, RopeByteStream, VecByteSink, VecByteStream,
+    BytesByteStream, RopeByteStream, SkipTakeStream, VecByteSink, VecByteStream,
 };
 pub use tuning::{DRAIN_CHUNK_BYTES, STREAM_CHUNK_BYTES, TCP_BUFFER_BYTES};
 pub use types::{

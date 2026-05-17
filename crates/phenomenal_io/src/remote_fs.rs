@@ -219,6 +219,19 @@ impl RemoteBackend {
             other            => Err(unexpected(other)),
         }
     }
+
+    /// Lock plane: refresh. `Ok(true)` entry stamped, `Ok(false)` entry
+    /// gone, `Err` network failure (caller counts as offline).
+    pub async fn lock_refresh(&self, resource: &str, uid: &str) -> IoResult<bool> {
+        match self.unary(Request::LockRefresh {
+            resource: resource.into(), uid: uid.into(),
+        }).await? {
+            Response::LockRefreshed => Ok(true),
+            Response::LockNotFound  => Ok(false),
+            Response::Err(e)        => Err(e.into()),
+            other                   => Err(unexpected(other)),
+        }
+    }
 }
 
 // `call_unit!` / `call_typed!` are thin wrappers that the 22-method
@@ -611,5 +624,8 @@ impl LockPeer for RemoteBackend {
     }
     async fn lock_release(&self, resource: &str, uid: &str) -> IoResult<()> {
         RemoteBackend::lock_release(self, resource, uid).await
+    }
+    async fn lock_refresh(&self, resource: &str, uid: &str) -> IoResult<bool> {
+        RemoteBackend::lock_refresh(self, resource, uid).await
     }
 }

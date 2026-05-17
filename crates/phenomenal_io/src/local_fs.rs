@@ -30,7 +30,7 @@ use compio::buf::{BufResult, IntoInner};
 
 use crate::alloc::PooledBuffer;
 use compio::fs::{File, OpenOptions};
-use compio::io::{AsyncReadAt, AsyncWriteAt, AsyncWriteAtExt};
+use compio::io::{AsyncReadAt, AsyncWriteAtExt};
 use uuid::Uuid;
 
 use crate::backend::StorageBackend;
@@ -862,31 +862,6 @@ async fn write_xl_meta_vectored(
 async fn write_all_bytes_at(mut file: &File, buf: bytes::Bytes, base_offset: u64) -> IoResult<()> {
     let BufResult(res, _) = file.write_all_at(buf, base_offset).await;
     res.map_err(IoError::Io)
-}
-
-/// Loop `compio::fs::File::write_at` until the buffer is fully written.
-/// Returns the drained [`PooledBuffer`] so callers can recycle the
-/// allocation. Partial writes are tracked via `Slice<PooledBuffer>` —
-/// `AVec` does not provide a Vec-style `drain`, so we slice the
-/// unsent tail forward with an updating `offset`.
-#[allow(dead_code)]
-async fn write_all_at(mut file: &File, mut buf: PooledBuffer, base_offset: u64) -> IoResult<PooledBuffer> {
-    use compio::buf::IoBuf;
-    let total = buf.len();
-    let mut written = 0;
-    while written < total {
-        let slice = buf.slice(written..total);
-        // todo: @arnav this seems inefficient can we do something optimal for nvme
-        let BufResult(res, slice_back) = file.write_at(slice, base_offset + written as u64).await;
-        buf = slice_back.into_inner();
-        let n = res.map_err(IoError::Io)?;
-        if n == 0 {
-            return Err(IoError::Io(std::io::Error::other("write returned 0")));
-        }
-        written += n;
-    }
-    buf.clear();
-    Ok(buf)
 }
 
 

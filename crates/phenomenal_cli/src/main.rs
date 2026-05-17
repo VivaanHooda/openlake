@@ -87,12 +87,16 @@ async fn main() -> Result<()> {
         DiskAddr { node_id: 0, disk_idx: 0 },
         Rc::new(LocalFsBackend::new(&cli.root)?),
     );
-    // todo: @arnav check this locking server, we need to make this distributed instead of centralized
     // CLI is single-process, single-writer; the no-op dsync grants
     // every acquire instantly. Multi-node deployments use the real
     // dsync client wired in `phenomenald` (see phenomenal_server::main).
-    let dsync  = Rc::new(phenomenal_storage::DsyncClient::no_op());
-    let engine = Rc::new(Engine::new(cluster, backends, dsync, 0));
+    // Engine takes one DsyncClient per erasure set; with the single
+    // implicit pool the CLI runs in, that's exactly one entry.
+    let num_sets = cluster.num_sets().max(1);
+    let dsync_by_set: Vec<Rc<phenomenal_storage::DsyncClient>> = (0..num_sets)
+        .map(|_| Rc::new(phenomenal_storage::DsyncClient::no_op()))
+        .collect();
+    let engine = Rc::new(Engine::new(cluster, backends, dsync_by_set, 0));
 
     match cli.cmd {
         Cmd::CreateBucket { bucket } => {

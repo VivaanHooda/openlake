@@ -87,6 +87,8 @@ pub enum Request {
     // not one per disk, so locks are addressed at node granularity.
     LockAcquire { resource: String, uid: String, ttl_ms: u32 },
     LockRelease { resource: String, uid: String },
+    /// Periodic lease refresh. Reply: `LockRefreshed` or `LockNotFound`.
+    LockRefresh { resource: String, uid: String },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -105,6 +107,8 @@ pub enum Response {
     FileBytes(Option<Vec<u8>>),
     LockGranted,
     LockDenied,
+    LockRefreshed,
+    LockNotFound,
     Err(WireError),
 }
 

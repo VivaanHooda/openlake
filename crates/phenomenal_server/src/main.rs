@@ -295,13 +295,17 @@ async fn run_runtime(
         .collect::<anyhow::Result<_>>()?;
     debug_assert_eq!(local_disks.len(), self_node.disk_count as usize);
 
-    // Build storage backends keyed by `DiskAddr`, plus a per-peer
-    // `PeerConn` so all `RemoteBackend` instances targeting the
-    // same peer share one TCP/TLS connection pool. Lock peers stay
-    // node-scoped: one entry per node, ordered by `cfg.nodes`.
+    // Build storage backends keyed by `DiskAddr`, plus a per-node
+    // `LockPeer` indexed by `NodeId`. The lock plane is per-erasure-set
+    // (built below once the cluster topology is finalized), so we
+    // memoize one LockPeer per node here and assemble the per-set
+    // peer lists by `set_node_ids`. Per-peer `PeerClient` is shared
+    // across every `RemoteBackend` targeting the same peer so they
+    // ride a single multiplexed h2 connection.
     let mut backends:   std::collections::HashMap<DiskAddr, Rc<dyn StorageBackend>> =
         std::collections::HashMap::with_capacity(cfg.nodes.iter().map(|n| n.disk_count as usize).sum());
-    let mut lock_peers: Vec<Rc<dyn LockPeer>> = Vec::with_capacity(cfg.nodes.len());
+    let mut lock_peer_by_node: std::collections::HashMap<phenomenal_storage::cluster::NodeId, Rc<dyn LockPeer>> =
+        std::collections::HashMap::with_capacity(cfg.nodes.len());
     let local_lock_peer: Rc<dyn LockPeer> =
         Rc::new(LocalLockPeer::new(lock_server.clone()));
 
@@ -314,7 +318,7 @@ async fn run_runtime(
                     disk_be.clone(),
                 );
             }
-            lock_peers.push(local_lock_peer.clone());
+            lock_peer_by_node.insert(n.id, local_lock_peer.clone());
         } else {
             // Peer node — one shared `PeerClient`, then one
             // `RemoteBackend` per disk on that peer. The `PeerClient`
@@ -347,7 +351,7 @@ async fn run_runtime(
             // disk_idx=0; its disk_idx field is unused by the
             // lock-plane RPCs (they don't carry disk_idx).
             let lock_rb = Rc::new(RemoteBackend::new(peer, 0));
-            lock_peers.push(lock_rb as Rc<dyn LockPeer>);
+            lock_peer_by_node.insert(n.id, lock_rb as Rc<dyn LockPeer>);
         }
     }
 
@@ -362,6 +366,17 @@ async fn run_runtime(
         .with_context(|| format!("runtime {runtime_id}: bind rpc on {}", cfg.rpc_addr))?;
 
     tracing::info!(runtime_id, s3 = %cfg.s3_addr, rpc = %cfg.rpc_addr, "runtime serving");
+
+    // Sweeper: one per process. Pin to runtime 0 to avoid duplicate work.
+    if runtime_id == 0 {
+        let sweep_target = lock_server.clone();
+        compio::runtime::spawn(async move {
+            crate::lock_server::run_sweeper(
+                sweep_target,
+                crate::lock_server::DEFAULT_SWEEP_INTERVAL,
+            ).await;
+        }).detach();
+    }
 
     let rpc_disks      = Rc::new(local_disks.clone());
     let rpc_locks      = lock_server.clone();
@@ -417,8 +432,24 @@ async fn run_runtime(
         default_parity_count: cfg.default_parity_count,
         deployment_id,
     };
-    let dsync  = Rc::new(DsyncClient::new(lock_peers));
-    let engine = Rc::new(Engine::new(cluster, backends, dsync, cfg.self_id));
+    // One DsyncClient per erasure set; peers = the unique nodes that
+    // own disks in that set. The coordinator only votes against the
+    // target nodes for the data, never the full cluster. `num_sets()`
+    // is at least 1 today (single implicit pool), so the `.max(1)`
+    // matches Engine's debug assertion when total_disks == 0 in
+    // pathological configs.
+    let num_sets = cluster.num_sets().max(1);
+    let mut dsync_by_set: Vec<Rc<DsyncClient>> = Vec::with_capacity(num_sets);
+    for set_idx in 0..num_sets {
+        let node_ids = cluster.set_node_ids(set_idx);
+        let peers: Vec<Rc<dyn LockPeer>> = node_ids.iter()
+            .map(|id| lock_peer_by_node.get(id)
+                .expect("every NodeId in set_node_ids must have a LockPeer")
+                .clone())
+            .collect();
+        dsync_by_set.push(Rc::new(DsyncClient::new(peers)));
+    }
+    let engine = Rc::new(Engine::new(cluster, backends, dsync_by_set, cfg.self_id));
 
     let s3_engine     = engine.clone();
     let s3_auth       = auth_state.clone();

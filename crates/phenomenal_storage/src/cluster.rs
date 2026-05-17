@@ -163,6 +163,26 @@ impl ClusterConfig {
         all[start..end].to_vec()
     }
 
+    /// Unique `NodeId`s that own at least one disk slot in `set_index`.
+    /// Returned in first-encountered slot order so two callers building
+    /// per-set peer lists agree on ordering without an extra sort.
+    ///
+    /// When `set_drive_count >= num_hosts` (host-symmetric layouts) the
+    /// result is every cluster node; when sets straddle node boundaries
+    /// because the operator chose a small `set_drive_count`, sets see
+    /// a strict subset of nodes — that subset is exactly the lock plane
+    /// for objects routed there.
+    pub fn set_node_ids(&self, set_index: usize) -> Vec<NodeId> {
+        let mut out  = Vec::with_capacity(self.set_drive_count);
+        let mut seen = std::collections::HashSet::with_capacity(self.set_drive_count);
+        for d in self.set_disks(set_index) {
+            if seen.insert(d.node_id) {
+                out.push(d.node_id);
+            }
+        }
+        out
+    }
+
     /// Map `(bucket, key)` to the set that owns it.
     ///
     /// Hash family: **SipHash-2-4** keyed by [`SET_HASH_KEY`].
@@ -310,6 +330,23 @@ mod tests {
             DiskAddr { node_id: 1, disk_idx: 0 },
             DiskAddr { node_id: 1, disk_idx: 1 },
         ]);
+    }
+
+    #[test]
+    fn set_node_ids_dedups_within_a_set() {
+        // 2 nodes × 4 disks, set_drive_count=4. Each set is wholly
+        // within one node, so set_node_ids returns exactly one node.
+        let c = n_nodes_d_disks(2, 4, 4);
+        assert_eq!(c.set_node_ids(0), vec![0u16]);
+        assert_eq!(c.set_node_ids(1), vec![1u16]);
+    }
+
+    #[test]
+    fn set_node_ids_host_symmetric() {
+        // 4 nodes × 1 disk, set_drive_count=4. One set spans all
+        // hosts; per-set lock plane equals the cluster.
+        let c = one_disk_per_node(4, 4);
+        assert_eq!(c.set_node_ids(0), vec![0u16, 1, 2, 3]);
     }
 
     #[test]

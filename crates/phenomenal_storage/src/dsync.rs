@@ -22,7 +22,8 @@
 //! treated as gone and the next acquire takes over.
 
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use futures_util::future::join_all;
@@ -30,48 +31,61 @@ use phenomenal_io::LockPeer;
 
 use crate::error::{StorageError, StorageResult};
 
-/// Default lease applied to every grant. Long enough that a typical
-/// PUT (small object, three-disk fan-out, single-digit milliseconds)
-/// clears it with a wide margin; short enough that a crashed holder
-/// only blocks others for a few seconds.
+/// Wire `ttl_ms` hint on acquire. Server's own validity is authoritative.
 const DEFAULT_LEASE: Duration = Duration::from_secs(30);
 
-/// Cap on the per-attempt backoff. The full retry budget is set by the
-/// caller's `acquire` deadline.
-const MAX_BACKOFF: Duration = Duration::from_millis(2_000);
+/// Cadence of the refresh ping. Server-side validity is 60s, so a 30s
+/// cadence lets us miss one refresh round (e.g. a tcp blip) and still
+/// re-stamp before the lease expires.
+const REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Base of the jittered exponential backoff window. The first denied
-/// round sleeps somewhere in [BASE, 2·BASE].
+/// Per-attempt acquire backoff caps.
+const MAX_BACKOFF:  Duration = Duration::from_millis(2_000);
 const BASE_BACKOFF: Duration = Duration::from_millis(50);
+
+/// Shared between `LockGuard` and its refresh task.
+struct LockState {
+    /// Set by `Drop` to stop the refresh loop.
+    stop: AtomicBool,
+    /// Set by the refresh task when quorum is lost. Engine reads via
+    /// `LockGuard::check` at fence points.
+    lost: AtomicBool,
+}
 
 /// Rc-shared, runtime-local. One per Engine instance. The peer order
 /// is irrelevant to correctness but must include every node in the
 /// object's set so quorum math (`peers.len() / 2 + 1`) lines up.
 pub struct DsyncClient {
-    peers:  Vec<Rc<dyn LockPeer>>,
-    quorum: usize,
+    peers:            Vec<Rc<dyn LockPeer>>,
+    quorum:           usize,
+    refresh_interval: Duration,
 }
 
 impl DsyncClient {
     pub fn new(peers: Vec<Rc<dyn LockPeer>>) -> Self {
         let quorum = peers.len() / 2 + 1;
-        Self { peers, quorum }
+        Self { peers, quorum, refresh_interval: REFRESH_INTERVAL }
     }
 
     /// Lock-less client. `acquire` returns immediately with a guard
     /// that does nothing on drop. Used by engine unit tests where
     /// there is exactly one writer in flight; not for production.
-    /// Production main.rs must build a real `DsyncClient` against the
-    /// set's peer list.
     #[doc(hidden)]
     pub fn no_op() -> Self {
-        Self { peers: Vec::new(), quorum: 0 }
+        Self { peers: Vec::new(), quorum: 0, refresh_interval: REFRESH_INTERVAL }
+    }
+
+    /// Override the refresh ping cadence. Tests use a short interval
+    /// to exercise lock-loss detection without waiting 10s.
+    #[doc(hidden)]
+    pub fn with_refresh_interval(mut self, interval: Duration) -> Self {
+        self.refresh_interval = interval;
+        self
     }
 
     /// Try to acquire `resource` within `timeout`. Returns a guard that
     /// will release the lock on drop. Returns `LockTimeout` if no
     /// majority is reached before the deadline.
-    // todo: @arnav lock refreshers and auto release etc needed to prevent race
     pub async fn acquire(
         &self,
         resource: &str,
@@ -99,10 +113,23 @@ impl DsyncClient {
                 .collect();
 
             if granted.len() >= self.quorum {
+                let state = Arc::new(LockState {
+                    stop: AtomicBool::new(false),
+                    lost: AtomicBool::new(false),
+                });
+                spawn_refresh_task(
+                    state.clone(),
+                    self.peers.clone(),
+                    self.quorum,
+                    resource.to_owned(),
+                    uid.clone(),
+                    self.refresh_interval,
+                );
                 return Ok(LockGuard {
                     resource: Some(resource.to_owned()),
                     uid:      Some(uid),
                     peers:    Some(self.peers.clone()),
+                    state,
                 });
             }
 
@@ -125,20 +152,39 @@ impl DsyncClient {
     }
 }
 
-/// RAII handle to a held lock. Drop fires a fire-and-forget release
-/// across every peer the lock was acquired from. Must be dropped on a
-/// thread with an active compio runtime.
+/// RAII handle to a held lock. Drop stops the refresh task and fires
+/// a fire-and-forget release. Must be dropped on a thread with an
+/// active compio runtime.
 pub struct LockGuard {
     resource: Option<String>,
     uid:      Option<String>,
     peers:    Option<Vec<Rc<dyn LockPeer>>>,
+    state:    Arc<LockState>,
+}
+
+impl LockGuard {
+    /// True iff the background refresh task could no longer prove
+    /// quorum hold.
+    pub fn is_lost(&self) -> bool {
+        self.state.lost.load(Ordering::Acquire)
+    }
+
+    /// Fence-point check. Returns `Err(LockLost)` if the refresh task
+    /// observed quorum loss since the last call. Cheap (atomic load).
+    pub fn check(&self) -> StorageResult<()> {
+        if self.is_lost() {
+            let res = self.resource.clone().unwrap_or_default();
+            return Err(StorageError::LockLost(res));
+        }
+        Ok(())
+    }
 }
 
 impl Drop for LockGuard {
     fn drop(&mut self) {
-        // Fields are taken out of `Option` so we can move them into the
-        // spawned release task; if any are missing the guard already
-        // released or never held the lock and there is nothing to do.
+        // Stop the refresh task on the next iteration boundary.
+        self.state.stop.store(true, Ordering::Release);
+
         let (Some(resource), Some(uid), Some(peers)) =
             (self.resource.take(), self.uid.take(), self.peers.take()) else { return };
 
@@ -154,9 +200,64 @@ impl Drop for LockGuard {
     }
 }
 
-/// `[base, base * 2^min(attempt, 6)]` capped at `MAX_BACKOFF`. Range is
-/// uniformly sampled with a process-local, time-mixed entropy source so
-/// concurrent writers desynchronise instead of marching in lockstep.
+/// Run the periodic refresh on a detached compio task. Marks `state.lost`
+/// and force-releases when refresh count cannot reach quorum.
+///
+/// Quorum math (matches MinIO's `refreshLock`):
+///   * `not_found > tolerance` → lost.
+///   * `offline` (network failure) is neutral; next round retries.
+fn spawn_refresh_task(
+    state:    Arc<LockState>,
+    peers:    Vec<Rc<dyn LockPeer>>,
+    quorum:   usize,
+    resource: String,
+    uid:      String,
+    interval: Duration,
+) {
+    if peers.is_empty() {
+        return; 
+    }
+    let tolerance = peers.len() - quorum;
+
+    compio::runtime::spawn(async move {
+        loop {
+            compio::runtime::time::sleep(interval).await;
+            if state.stop.load(Ordering::Acquire) { return; }
+
+            let refreshes = peers.iter().map(|p| {
+                let p   = p.clone();
+                let res = resource.clone();
+                let uid = uid.clone();
+                async move { p.lock_refresh(&res, &uid).await }
+            });
+            let results = join_all(refreshes).await;
+
+            if state.stop.load(Ordering::Acquire) { return; }
+
+            let mut not_found = 0usize;
+            for r in results {
+                if let Ok(false) = r { not_found += 1; }
+            }
+            if not_found > tolerance {
+                state.lost.store(true, Ordering::Release);
+                let res = resource.clone();
+                let uid = uid.clone();
+                let peers = peers.clone();
+                compio::runtime::spawn(async move {
+                    let releases = peers.iter().map(|p| {
+                        let p   = p.clone();
+                        let res = res.clone();
+                        let uid = uid.clone();
+                        async move { let _ = p.lock_release(&res, &uid).await; }
+                    });
+                    join_all(releases).await;
+                }).detach();
+                return;
+            }
+        }
+    }).detach();
+}
+
 fn jitter(attempt: u32) -> Duration {
     let base = BASE_BACKOFF.as_millis() as u64;
     let cap  = MAX_BACKOFF .as_millis() as u64;
@@ -240,6 +341,16 @@ mod tests {
             if m.get(res).is_some_and(|(u, _)| u == uid) { m.remove(res); }
             Ok(())
         }
+        async fn lock_refresh(&self, res: &str, uid: &str) -> IoResult<bool> {
+            let mut m = self.state.borrow_mut();
+            match m.get_mut(res) {
+                Some((u, exp)) if u == uid => {
+                    *exp = Instant::now() + Duration::from_secs(30);
+                    Ok(true)
+                }
+                _ => Ok(false),
+            }
+        }
     }
 
     fn fake_client(n: usize) -> (DsyncClient, Vec<Rc<FakePeer>>) {
@@ -286,5 +397,42 @@ mod tests {
         let mut s = std::collections::HashSet::new();
         for _ in 0..1024 { s.insert(fresh_uid()); }
         assert_eq!(s.len(), 1024);
+    }
+
+    #[compio::test]
+    async fn refresh_keeps_guard_alive_across_rounds() {
+        // Short refresh cadence so we can observe several rounds in
+        // a millisecond budget. FakePeer.lock_refresh re-stamps the
+        // entry expiry, so as long as the refresh task is running
+        // the guard stays unlost regardless of the initial ttl.
+        let peers: Vec<Rc<FakePeer>> = (0..3).map(|_| Rc::new(FakePeer::new())).collect();
+        let dyn_peers: Vec<Rc<dyn LockPeer>> = peers.iter().map(|p| p.clone() as _).collect();
+        let c = DsyncClient::new(dyn_peers).with_refresh_interval(Duration::from_millis(20));
+
+        let g = c.acquire("k", Duration::from_secs(1)).await.unwrap();
+        compio::runtime::time::sleep(Duration::from_millis(80)).await;
+        assert!(!g.is_lost());
+        assert!(g.check().is_ok());
+    }
+
+    #[compio::test]
+    async fn quorum_lost_marks_guard_lost() {
+        // Three peers, quorum=2, tolerance=1. After acquire, wipe
+        // state on a majority (simulating restart / sweep). The
+        // next refresh round sees 2 not_found which exceeds
+        // tolerance, so the guard is marked lost.
+        let peers: Vec<Rc<FakePeer>> = (0..3).map(|_| Rc::new(FakePeer::new())).collect();
+        let dyn_peers: Vec<Rc<dyn LockPeer>> = peers.iter().map(|p| p.clone() as _).collect();
+        let c = DsyncClient::new(dyn_peers).with_refresh_interval(Duration::from_millis(20));
+
+        let g = c.acquire("k", Duration::from_secs(1)).await.unwrap();
+        assert!(!g.is_lost());
+
+        peers[0].state.borrow_mut().clear();
+        peers[1].state.borrow_mut().clear();
+
+        compio::runtime::time::sleep(Duration::from_millis(60)).await;
+        assert!(g.is_lost());
+        assert!(matches!(g.check(), Err(StorageError::LockLost(_))));
     }
 }

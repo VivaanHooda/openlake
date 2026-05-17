@@ -141,8 +141,6 @@ pub trait StorageBackend {
         opts: &UpdateMetadataOpts,
     ) -> IoResult<()>;
 
-    // todo: @arnav: implement range based get.
-    // todo: @arnav: delete version seems dead code pls remove if not used
     async fn delete_version(
         &self,
         volume: &str,
@@ -183,4 +181,7 @@ pub trait StorageBackend {
 pub trait LockPeer {
     async fn lock_acquire(&self, resource: &str, uid: &str, ttl_ms: u32) -> IoResult<bool>;
     async fn lock_release(&self, resource: &str, uid: &str) -> IoResult<()>;
+    /// Extend the lease. `true` = entry found, `last_refresh` stamped;
+    /// `false` = entry gone (peer restarted, swept, taken over).
+    async fn lock_refresh(&self, resource: &str, uid: &str) -> IoResult<bool>;
 }

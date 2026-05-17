@@ -250,6 +250,62 @@ impl ByteStream for RopeByteStream {
     }
 }
 
+/// Wraps a `ByteStream` to expose a contiguous byte window: drops the
+/// first `skip` bytes from the inner stream and yields at most `take`
+/// bytes after that, then signals EOF. Used by the engine's range GET
+/// path so it can compose on top of the existing full-object walker
+/// (inline body or EC stripe walker) without introducing a parallel
+/// reader. All slicing is zero copy via `bytes::Bytes::slice`.
+///
+/// Boundary safe across arbitrary inner chunk sizes: a chunk that
+/// straddles the skip/take transition is sliced once; chunks fully
+/// inside the skip window are dropped without copying; chunks past
+/// the take window are never requested.
+pub struct SkipTakeStream {
+    inner:     Box<dyn ByteStream>,
+    to_skip:   u64,
+    remaining: u64,
+}
+
+impl SkipTakeStream {
+    pub fn new(inner: Box<dyn ByteStream>, skip: u64, take: u64) -> Self {
+        Self { inner, to_skip: skip, remaining: take }
+    }
+}
+
+#[async_trait(?Send)]
+impl ByteStream for SkipTakeStream {
+    async fn read(&mut self) -> IoResult<Bytes> {
+        loop {
+            if self.remaining == 0 {
+                return Ok(Bytes::new());
+            }
+            let chunk = self.inner.read().await?;
+            if chunk.is_empty() {
+                // Upstream EOF before we filled the window. The caller
+                // validated bounds against `info.size` before opening
+                // us, so this only fires on a truncated source (which
+                // is itself an integrity problem one layer down).
+                return Ok(Bytes::new());
+            }
+            if self.to_skip >= chunk.len() as u64 {
+                self.to_skip -= chunk.len() as u64;
+                continue;
+            }
+            let drop = self.to_skip as usize;
+            self.to_skip = 0;
+            // UFCS on Bytes::slice — the bare `chunk.slice(..)` form
+            // would dispatch to `compio::buf::IoBuf::slice` (imported
+            // at the top of the file for the pump loops below) and
+            // return `compio::buf::Slice<Bytes>` instead of `Bytes`.
+            let kept = if drop == 0 { chunk } else { bytes::Bytes::slice(&chunk, drop..) };
+            let take = (self.remaining as usize).min(kept.len());
+            self.remaining -= take as u64;
+            return Ok(if take == kept.len() { kept } else { bytes::Bytes::slice(&kept, ..take) });
+        }
+    }
+}
+
 /// Sink that accumulates writes into a `Vec<u8>`. Used as the inline
 /// staging buffer for ≤128 KiB EC reconstructions and in tests.
 #[derive(Default)]
@@ -295,3 +351,83 @@ impl ByteSink for VecByteSink {
 // no intermediate scratch. `CompioWriter` was unused. If we ever need
 // a "bound an `AsyncRead` to N bytes and expose as `ByteStream`"
 // helper again, see git history for the implementation.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+
+    /// Test source that yields the supplied chunks in order, then EOF.
+    /// Each chunk is owned, so the SkipTakeStream slicing exercises
+    /// real refcount semantics on `bytes::Bytes`.
+    struct ChunkSource(VecDeque<Bytes>);
+
+    #[async_trait(?Send)]
+    impl ByteStream for ChunkSource {
+        async fn read(&mut self) -> IoResult<Bytes> {
+            Ok(self.0.pop_front().unwrap_or_default())
+        }
+    }
+
+    fn chunks(parts: &[&[u8]]) -> Box<dyn ByteStream> {
+        Box::new(ChunkSource(parts.iter().map(|b| Bytes::copy_from_slice(b)).collect()))
+    }
+
+    async fn drain(s: &mut dyn ByteStream) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let c = s.read().await.unwrap();
+            if c.is_empty() {
+                return out;
+            }
+            out.extend_from_slice(&c);
+        }
+    }
+
+    #[compio::test]
+    async fn skip_take_within_single_chunk() {
+        let mut s = SkipTakeStream::new(chunks(&[b"0123456789"]), 2, 5);
+        assert_eq!(drain(&mut s).await, b"23456");
+    }
+
+    #[compio::test]
+    async fn skip_take_across_chunks() {
+        let mut s = SkipTakeStream::new(chunks(&[b"01234", b"56789", b"abcde"]), 3, 8);
+        assert_eq!(drain(&mut s).await, b"3456789a");
+    }
+
+    #[compio::test]
+    async fn skip_consumes_full_chunks_then_partial() {
+        // skip 8 bytes drops the first two chunks entirely, then yields
+        // the remaining take from the third chunk.
+        let mut s = SkipTakeStream::new(chunks(&[b"AAAA", b"BBBB", b"CCCC"]), 8, 4);
+        assert_eq!(drain(&mut s).await, b"CCCC");
+    }
+
+    #[compio::test]
+    async fn take_zero_yields_eof_immediately() {
+        let mut s = SkipTakeStream::new(chunks(&[b"data"]), 0, 0);
+        assert_eq!(drain(&mut s).await, Vec::<u8>::new());
+    }
+
+    #[compio::test]
+    async fn take_exceeding_upstream_truncates_at_eof() {
+        // The window claims 100 bytes but the source only has 3; we
+        // serve 3 and stop. Production code never reaches this because
+        // the handler validates bounds, but the adapter must be safe.
+        let mut s = SkipTakeStream::new(chunks(&[b"abc"]), 0, 100);
+        assert_eq!(drain(&mut s).await, b"abc");
+    }
+
+    #[compio::test]
+    async fn skip_past_eof_yields_empty() {
+        let mut s = SkipTakeStream::new(chunks(&[b"abc"]), 99, 1);
+        assert_eq!(drain(&mut s).await, Vec::<u8>::new());
+    }
+
+    #[compio::test]
+    async fn zero_skip_returns_prefix_take() {
+        let mut s = SkipTakeStream::new(chunks(&[b"hello world"]), 0, 5);
+        assert_eq!(drain(&mut s).await, b"hello");
+    }
+}

@@ -534,6 +534,13 @@ async fn dispatch(
             locks.release(&resource, &uid);
             RpcResponse::Ok
         }
+        LockRefresh { resource, uid } => {
+            if locks.refresh(&resource, &uid) {
+                RpcResponse::LockRefreshed
+            } else {
+                RpcResponse::LockNotFound
+            }
+        }
     }
 }
 

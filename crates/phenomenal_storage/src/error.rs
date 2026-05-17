@@ -37,6 +37,10 @@ pub enum StorageError {
     #[error("lock timeout on {0}")]
     LockTimeout(String),
 
+    /// Mid-op lock loss: refresh failed to reach quorum.
+    #[error("lock lost on {0}")]
+    LockLost(String),
+
     /// Read-side metadata consensus could not reach the per-disk
     /// quorum: enough disks were alive but their metadata records
     /// disagree on content (etag, parts, EC config, etc.). Surfaces

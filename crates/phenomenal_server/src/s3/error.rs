@@ -77,6 +77,7 @@ fn map_storage(e: &StorageError) -> (StatusCode, String, String) {
         StorageError::InvalidBucketName(_)             => (StatusCode::BAD_REQUEST,          "InvalidBucketName"),
         StorageError::InvalidObjectKey(_)              => (StatusCode::BAD_REQUEST,          "InvalidObjectName"),
         StorageError::LockTimeout(_)                   => (StatusCode::SERVICE_UNAVAILABLE,  "SlowDown"),
+        StorageError::LockLost(_)                      => (StatusCode::SERVICE_UNAVAILABLE,  "SlowDown"),
         // Both consensus failures map to 503 (transient — the cluster
         // is currently unable to satisfy this read; retry may succeed
         // once heal restores quorum). Distinct error codes so operators

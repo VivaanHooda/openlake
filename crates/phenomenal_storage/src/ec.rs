@@ -61,10 +61,6 @@ impl Erasure {
         Ok(Self { data_shards, parity_shards })
     }
 
-    pub fn total_shards(&self) -> usize {
-        self.data_shards + self.parity_shards
-    }
-
     /// Encode one full stripe (`data_shards * unit` bytes, already
     /// zero-padded) into `data_shards + parity_shards` shards. Returns
     /// the shards in slot order: D data shards first (zero-copy slices
