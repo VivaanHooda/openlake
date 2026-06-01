@@ -5,7 +5,7 @@
   ## Getting help
 
   - Chat: [Discord](https://discord.gg/TNXqVSnP6x)
-  - Bugs and feature requests: [GitHub Issues](https://github.com/theopenlake/openlake/issues) **[TODO: confirm org]**
+  - Bugs and feature requests: [GitHub Issues](https://github.com/openlake-project/openlake/issues)
   - Website: [theopenlake.com](https://theopenlake.com)
 
   ## Filing an issue
